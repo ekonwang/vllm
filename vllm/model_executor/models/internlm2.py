@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.attention import Attention, AttentionMetadata
-from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
@@ -15,11 +14,14 @@ from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import Sampler
+from vllm.model_executor.layers.sampler import Sampler, MockSampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_world_size)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.weight_utils import (default_weight_loader,
+                                              hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
 
 
@@ -210,6 +212,7 @@ class InternLM2Model(nn.Module):
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.DEBUG_START = False
 
     def forward(
         self,
@@ -247,6 +250,7 @@ class InternLM2ForCausalLM(nn.Module):
         self.output = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
+        self.DEBUG_START = False
 
     def forward(
         self,
@@ -263,6 +267,9 @@ class InternLM2ForCausalLM(nn.Module):
                        sampling_metadata: SamplingMetadata) -> torch.Tensor:
         logits = self.logits_processor(self.output.weight, hidden_states,
                                        sampling_metadata)
+        # --- @YIKUN: 4.18 for InternLM Preference vllm acceleration (IPVA project) debugging --- #
+        # if self.DEBUG_START:
+        #     # import pdb; pdb.set_trace()
         return logits
 
     def sample(
@@ -271,16 +278,141 @@ class InternLM2ForCausalLM(nn.Module):
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
         next_tokens = self.sampler(logits, sampling_metadata)
+        # --- 4.18 for InternLM Preference vllm acceleration (IPVA project) debugging --- #
+        # if self.DEBUG_START:
+        #     # import pdb; pdb.set_trace()
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self,
+                     model_name_or_path: str,
+                     cache_dir: Optional[str] = None,
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "w1", 0),
             ("gate_up_proj", "w3", 1),
         ]
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
+            if "rotary_emb.inv_freq" in name:
+                continue
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                if "wqkv" in name:
+                    config = self.config
+                    kv_groups = (config.num_attention_heads //
+                                 config.num_key_value_heads)
+                    head_dim = config.hidden_size // config.num_attention_heads
+                    loaded_weight = loaded_weight.view(-1, 2 + kv_groups,
+                                                       head_dim,
+                                                       loaded_weight.shape[-1])
+                    wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1],
+                                             dim=1)
+                    wq = wq.reshape(-1, wq.shape[-1])
+                    wk = wk.reshape(-1, wk.shape[-1])
+                    wv = wv.reshape(-1, wv.shape[-1])
+                    weight_loader = param.weight_loader
+                    weight_loader(param, wq, 'q')
+                    weight_loader(param, wk, 'k')
+                    weight_loader(param, wv, 'v')
+                else:
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+
+
+class InternLM2ForSequenceClassification(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        linear_method: Optional[LinearMethodBase] = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.linear_method = linear_method
+        self.model = InternLM2Model(config, linear_method)
+        # self.score = ParallelLMHead(1, config.hidden_size)
+        self.score = nn.Linear(config.hidden_size, 1, bias=False)
+        self.logits_processor = LogitsProcessor(1)
+        self.sampler = MockSampler()
+        self.preference_max_length = config.preference_max_length
+        self.DEBUG_START = False
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        # TODO: the `input_ids` seems to be wrong. 
+        hidden_states = self.model(input_ids, positions, kv_caches,
+                                   attn_metadata)
+        self.subquery_start_loc = attn_metadata.subquery_start_loc
+        self.prompt_lens = attn_metadata.prompt_lens
+        if isinstance(self.prompt_lens, list):
+            self.prompt_lens = torch.tensor(self.prompt_lens, device=hidden_states.device, dtype=torch.long)
+            self.prompt_lens = torch.clip(self.prompt_lens, 0, self.preference_max_length)
+        else:
+            self.prompt_lens = None
+        return hidden_states
+
+    def compute_logits(self, hidden_states: torch.Tensor,
+                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        if (self.prompt_lens is not None) and self.prompt_lens.dtype == torch.long:
+            self.last_selected_idxs = self.subquery_start_loc[:-1] + self.prompt_lens - 1
+            selected_hidden_states = hidden_states[self.last_selected_idxs]
+            self.prompt_lens = None 
+        else:
+            # mock run
+            selected_hidden_states = hidden_states[:20]
+
+        logits = self.score(selected_hidden_states)
+        if self.DEBUG_START:
+            import pdb; pdb.set_trace()
+        return logits
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[SamplerOutput]:
+        # @YIKUN: 直接返回 tensor 导致 vllm 任务无法结束。
+        # return logits
+        # 简单用伪 Sampler 进行封装，避免 vllm 任务队列认为任务未结束
+        logits_res = logits.cpu().tolist()
+        return logits_res, self.sampler(logits, sampling_metadata)
+
+    def load_weights(self,
+                     model_name_or_path: str,
+                     cache_dir: Optional[str] = None,
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "w1", 0),
+            ("gate_up_proj", "w3", 1),
+        ]
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
             if "rotary_emb.inv_freq" in name:
                 continue
             for (param_name, weight_name, shard_id) in stacked_params_mapping:

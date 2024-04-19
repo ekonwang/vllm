@@ -27,12 +27,6 @@ class Sampler(nn.Module):
     6. Sample the next tokens.
     Here, each sequence group within the batch can have different sampling
     parameters (e.g., sampling method, temperature, top-p, top-k, etc.).
-
-    The structure of the logits tensor is coupled with the seq_groups in
-    sampling_metadata. Typically, each sequence in each seq_group has one row in
-    logits for the next token to be sampled; however, for a seq_group with a
-    prompt request with the prompt_logprobs sampling parameter, there are rows
-    in logits for each token in the input prompt.
     """
 
     def forward(
@@ -88,6 +82,76 @@ class Sampler(nn.Module):
                                      prompt_logprobs, sample_logprobs)
 
 
+class MockSampler(nn.Module):
+    """Samples the next tokens from the model's outputs.
+
+    This layer does the following:
+    1. Discard the hidden states that are not used for sampling (i.e., all
+        tokens except the final one in each prompt).
+    2. Compute the logits for the next tokens.
+    3. Apply presence, frequency and repetition penalties.
+    4. Apply temperature scaling.
+    5. Apply top-p and top-k truncation.
+    6. Sample the next tokens.
+    Here, each sequence group within the batch can have different sampling
+    parameters (e.g., sampling method, temperature, top-p, top-k, etc.).
+    """
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[SamplerOutput]:
+        assert logits is not None
+        _, vocab_size = logits.shape
+        logits_to_keep = logits.clone()
+
+        # Apply min_tokens penalty which sets stop tokens to -inf if min_tokens
+        # have not been generated yet
+        logits = _apply_min_tokens_penalty(logits, sampling_metadata)
+
+        # Prepare sampling tensors with pinned memory to avoid blocking.
+        (sampling_tensors, do_penalties, do_top_p_top_k,
+         do_min_p) = SamplingTensors.from_sampling_metadata(
+             sampling_metadata, vocab_size, logits.device, logits.dtype)
+
+        # Apply presence and frequency penalties.
+        if do_penalties:
+            logits = _apply_penalties(logits, sampling_tensors.prompt_tokens,
+                                      sampling_tensors.output_tokens,
+                                      sampling_tensors.presence_penalties,
+                                      sampling_tensors.frequency_penalties,
+                                      sampling_tensors.repetition_penalties)
+
+        # Apply temperature scaling.
+        # Use in-place division to avoid creating a new tensor.
+        logits.div_(sampling_tensors.temperatures.unsqueeze_(dim=1))
+
+        if do_top_p_top_k:
+            logits = _apply_top_k_top_p(logits, sampling_tensors.top_ps,
+                                        sampling_tensors.top_ks)
+
+        if do_min_p:
+            logits = _apply_min_p(logits, sampling_tensors.min_ps)
+
+        # We use float32 for probabilities and log probabilities.
+        # Compute the probabilities.
+        probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+        # Compute the log probabilities.
+        # Use log_softmax to ensure numerical stability.
+        logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
+
+        # Sample the next tokens.
+        sample_results = _sample(probs, logprobs, sampling_metadata,
+                                 sampling_tensors)
+        # Get the logprobs query results.
+        prompt_logprobs, sample_logprobs = _get_logprobs(
+            logprobs, sampling_metadata, sample_results)
+        
+        return _build_sampler_output_mock(sample_results, sampling_metadata,
+                                     prompt_logprobs, sample_logprobs, logits_to_keep)
+
+
 def _get_bin_counts_and_mask(
     tokens: torch.Tensor,
     vocab_size: int,
@@ -112,16 +176,7 @@ def _apply_min_tokens_penalty(
     # list of indices in logits that will be set to -inf
     logits_to_penalize = []
     start_idx = 0
-    for i, seq_group in enumerate(sampling_metadata.seq_groups):
-        seq_ids, sampling_params = seq_group
-
-        # handle prompt_logprobs by skipping rows in logits added for the prompt
-        # tokens (prompt logprobs are not penalized)
-        if (i < sampling_metadata.num_prompts
-                and sampling_params.prompt_logprobs is not None):
-            assert len(seq_ids) == 1
-            start_idx += sampling_metadata.prompt_lens[i] - 1
-
+    for seq_ids, sampling_params in sampling_metadata.seq_groups:
         min_tokens = sampling_params.min_tokens
         if min_tokens > 0:
             seqs_to_penalize = []
@@ -147,8 +202,6 @@ def _apply_min_tokens_penalty(
         # eg. [ (1,2), (1,3), (5,6) ] -> ( (1,1,5), (2,3,6) )
         logits[tuple(zip(*logits_to_penalize))] = -float("inf")
 
-    # verifies that no rows in logits were missed unexpectedly
-    assert start_idx == logits.shape[0]
     return logits
 
 
@@ -701,4 +754,33 @@ def _build_sampler_output(
                 SequenceOutput(seq_ids[parent_id], next_token_id, logprobs))
         sampler_output.append(
             SequenceGroupOutput(seq_outputs, group_prompt_logprobs))
+    # @Yikun: Sampler tackling
+    return SamplerOutput(outputs=sampler_output)
+
+
+def _build_sampler_output_mock(
+    sample_results: List[Tuple[List[int], List[int]]],
+    sampling_metadata: SamplingMetadata,
+    prompt_logprobs: List[Optional[PromptLogprobs]],
+    sample_logprobs: List[SampleLogprobs],
+    logits_to_keep: torch.Tensor = None,
+) -> SamplerOutput:
+    logits_to_keep = logits_to_keep.cpu().tolist()
+    sampler_output = []
+    for (seq_group, sample_result, group_prompt_logprobs,
+         group_sample_logprobs, logits) in zip(sampling_metadata.seq_groups,
+                                       sample_results, prompt_logprobs,
+                                       sample_logprobs, logits_to_keep):
+        seq_ids, _ = seq_group
+        next_token_ids, parent_ids = sample_result
+        seq_outputs = []
+        for parent_id, next_token_id, logprobs in zip(parent_ids,
+                                                      next_token_ids,
+                                                      group_sample_logprobs):
+            seq_outputs.append(
+                SequenceOutput(seq_ids[parent_id], next_token_id, logprobs, logits))
+        sampler_output.append(
+            SequenceGroupOutput(seq_outputs, group_prompt_logprobs))
+    # @Yikun: Sampler tackling
+    # import pdb; pdb.set_trace()
     return SamplerOutput(outputs=sampler_output)

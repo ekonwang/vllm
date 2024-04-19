@@ -11,8 +11,7 @@ import torch
 from flash_attn import flash_attn_varlen_func
 
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
-                                              AttentionMetadata,
-                                              AttentionMetadataPerStage)
+                                              AttentionMetadata)
 from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 
@@ -54,8 +53,7 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 @dataclass
-class FlashAttentionMetadata(AttentionMetadataPerStage,
-                             PagedAttentionMetadata):
+class FlashAttentionMetadata(AttentionMetadata, PagedAttentionMetadata):
     """Metadata for FlashAttentionBackend.
 
     NOTE: Any python object stored here is not updated when it is
@@ -70,6 +68,10 @@ class FlashAttentionMetadata(AttentionMetadataPerStage,
     prompt_lens: Optional[List[int]]
     # prompt_lens stored as a tensor.
     prompt_lens_tensor: Optional[torch.Tensor]
+    # The number of prompt tokens. Doesn't include padding.
+    num_prompt_tokens: int
+    # The number of generation tokens. Doesn't include padding.
+    num_generation_tokens: int
 
     # NOTE(sang): Definition of context_len, subquery_len, and seqlen.
     # |---------- N-1 iteration --------|
@@ -105,27 +107,18 @@ class FlashAttentionMetadata(AttentionMetadataPerStage,
 class FlashAttentionImpl(AttentionImpl):
     """
     If the input tensors contain prompt tokens, the layout is as follows:
-    |<--------------- num_prefill_tokens ----------------->|	
-    |<--prefill_0-->|<--prefill_1-->|...|<--prefill_N-1--->|
+    |<--------------- num_prompt_tokens -------------->|	
+    |<--prompt_0-->|<--prompt_1-->|...|<--prompt_N-1-->|
 
     Otherwise, the layout is as follows:	
-    |<----------------- num_decode_tokens ------------------>|	
-    |<--decode_0-->|..........|<--decode_M-1-->|<--padding-->|
+    |<------------------ num_generation_tokens (M) ----------------->|	
+    |<--generation_0-->|..........|<--generation_M-1-->|<--padding-->|
 
     Generation tokens can contain padding when cuda-graph is used.
     Currently, prompt tokens don't contain any padding.
 
     The prompts might have different lengths, while the generation tokens
     always have length 1.
-
-    If chunked prefill is enabled, prefill tokens and decode tokens can be
-    batched together in a flattened 1D query.
-
-    |<----- num_prefill_tokens ---->|<------- num_decode_tokens --------->|
-    |<-prefill_0->|...|<-prefill_N-1->|<--decode_0-->|...|<--decode_M-1-->|
-
-    Currently, cuda graph is disabled for chunked prefill, meaning there's no
-    padding between prefill and decode tokens.
     """
 
     def __init__(
@@ -162,8 +155,7 @@ class FlashAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata[FlashAttentionMetadata],
-        kv_scale: float,
+        attn_metadata: FlashAttentionMetadata,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention and PagedAttention.
 
@@ -192,78 +184,55 @@ class FlashAttentionImpl(AttentionImpl):
             PagedAttention.write_to_paged_cache(key, value, key_cache,
                                                 value_cache,
                                                 attn_metadata.slot_mapping,
-                                                attn_metadata.kv_cache_dtype,
-                                                kv_scale)
+                                                attn_metadata.kv_cache_dtype)
 
-        num_prefill_tokens = attn_metadata.num_prefill_tokens
-        num_decode_tokens = attn_metadata.num_decode_tokens
-        assert key.shape[0] == num_prefill_tokens + num_decode_tokens
-        assert value.shape[0] == num_prefill_tokens + num_decode_tokens
-
-        output = torch.empty_like(query)
-        # Query for decode. KV is not needed because it is already cached.
-        decode_query = query[num_prefill_tokens:]
-        # QKV for prefill.
-        query = query[:num_prefill_tokens]
-        key = key[:num_prefill_tokens]
-        value = value[:num_prefill_tokens]
-
-        assert query.shape[0] == num_prefill_tokens
-        assert decode_query.shape[0] == num_decode_tokens
-
-        if prefill_meta := attn_metadata.prefill_metadata:
+        if attn_metadata.is_prompt:
             # Prompt run.
-            if kv_cache is None or prefill_meta.block_tables.numel() == 0:
+            if kv_cache is None or attn_metadata.block_tables.numel() == 0:
                 # normal attention
                 # When block_tables are not filled, it means q and k are the
                 # prompt, and they have the same length.
-                out = flash_attn_varlen_func(
+                output = flash_attn_varlen_func(
                     q=query,
                     k=key,
                     v=value,
-                    cu_seqlens_q=prefill_meta.seq_start_loc,
-                    cu_seqlens_k=prefill_meta.seq_start_loc,
-                    max_seqlen_q=prefill_meta.max_prompt_len,
-                    max_seqlen_k=prefill_meta.max_prompt_len,
+                    cu_seqlens_q=attn_metadata.seq_start_loc,
+                    cu_seqlens_k=attn_metadata.seq_start_loc,
+                    max_seqlen_q=attn_metadata.max_prompt_len,
+                    max_seqlen_k=attn_metadata.max_prompt_len,
                     softmax_scale=self.scale,
                     causal=True,
                     window_size=self.sliding_window,
                     alibi_slopes=self.alibi_slopes,
                 )
-                assert output[:num_prefill_tokens].shape == out.shape
-                output[:num_prefill_tokens] = out
             else:
                 # prefix-enabled attention
-                # TODO(Hai) this triton kernel has regression issue (broke) to
-                # deal with different data types between KV and FP8 KV cache,
-                # to be addressed separately.
-                output[:num_prefill_tokens] = PagedAttention.forward_prefix(
+                output = PagedAttention.forward_prefix(
                     query,
                     key,
                     value,
                     key_cache,
                     value_cache,
-                    prefill_meta.block_tables,
-                    prefill_meta.subquery_start_loc,
-                    prefill_meta.prompt_lens_tensor,
-                    prefill_meta.context_lens,
-                    prefill_meta.max_subquery_len,
+                    attn_metadata.block_tables,
+                    attn_metadata.subquery_start_loc,
+                    attn_metadata.prompt_lens_tensor,
+                    attn_metadata.context_lens,
+                    attn_metadata.max_subquery_len,
                     self.alibi_slopes,
                 )
-        if decode_meta := attn_metadata.decode_metadata:
+        else:
             # Decoding run.
-            output[num_prefill_tokens:] = PagedAttention.forward_decode(
-                decode_query,
+            output = PagedAttention.forward_decode(
+                query,
                 key_cache,
                 value_cache,
-                decode_meta.block_tables,
-                decode_meta.context_lens,
-                decode_meta.max_context_len,
+                attn_metadata.block_tables,
+                attn_metadata.context_lens,
+                attn_metadata.max_context_len,
                 attn_metadata.kv_cache_dtype,
                 self.num_kv_heads,
                 self.scale,
                 self.alibi_slopes,
-                kv_scale,
             )
 
         # Reshape the output tensor.

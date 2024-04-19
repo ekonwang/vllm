@@ -1,13 +1,11 @@
 import argparse
 import dataclasses
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
-from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
-                         EngineConfig, LoadConfig, LoRAConfig, ModelConfig,
-                         ParallelConfig, SchedulerConfig, SpeculativeConfig,
-                         TokenizerPoolConfig, VisionLanguageConfig)
-from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+from vllm.config import (CacheConfig, DeviceConfig, LoRAConfig, ModelConfig,
+                         ParallelConfig, SchedulerConfig, TokenizerPoolConfig,
+                         VisionLanguageConfig)
 from vllm.utils import str_to_int_tuple
 
 
@@ -22,7 +20,6 @@ class EngineArgs:
     load_format: str = 'auto'
     dtype: str = 'auto'
     kv_cache_dtype: str = 'auto'
-    quantization_param_path: Optional[str] = None
     seed: int = 0
     max_model_len: Optional[int] = None
     worker_use_ray: bool = False
@@ -56,9 +53,8 @@ class EngineArgs:
     max_cpu_loras: Optional[int] = None
     device: str = 'auto'
     ray_workers_use_nsight: bool = False
-    num_gpu_blocks_override: Optional[int] = None
+    forced_num_gpu_blocks: Optional[int] = None
     num_lookahead_slots: int = 0
-    model_loader_extra_config: Optional[dict] = None
 
     # Related to Vision-language models such as llava
     image_input_type: Optional[str] = None
@@ -67,11 +63,6 @@ class EngineArgs:
     image_feature_size: Optional[int] = None
     scheduler_delay_factor: float = 0.0
     enable_chunked_prefill: bool = False
-
-    guided_decoding_backend: str = 'outlines'
-    # Speculative decoding configuration.
-    speculative_model: Optional[str] = None
-    num_speculative_tokens: Optional[int] = None
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -137,9 +128,7 @@ class EngineArgs:
             '--load-format',
             type=str,
             default=EngineArgs.load_format,
-            choices=[
-                'auto', 'pt', 'safetensors', 'npcache', 'dummy', 'tensorizer'
-            ],
+            choices=['auto', 'pt', 'safetensors', 'npcache', 'dummy'],
             help='The format of the model weights to load. '
             '"auto" will try to load the weights in the safetensors format '
             'and fall back to the pytorch bin format if safetensors format '
@@ -149,10 +138,7 @@ class EngineArgs:
             '"npcache" will load the weights in pytorch format and store '
             'a numpy cache to speed up the loading. '
             '"dummy" will initialize the weights with random values, '
-            'which is mainly for profiling.'
-            '"tensorizer" will load the weights using tensorizer from CoreWeave'
-            'which assumes tensorizer_uri is set to the location of the '
-            'serialized weights.')
+            'which is mainly for profiling.')
         parser.add_argument(
             '--dtype',
             type=str,
@@ -167,35 +153,16 @@ class EngineArgs:
         parser.add_argument(
             '--kv-cache-dtype',
             type=str,
-            choices=['auto', 'fp8'],
+            choices=['auto', 'fp8_e5m2'],
             default=EngineArgs.kv_cache_dtype,
             help='Data type for kv cache storage. If "auto", will use model '
-            'data type. FP8_E5M2 (without scaling) is only supported on cuda '
-            'version greater than 11.8. On ROCm (AMD GPU), FP8_E4M3 is instead '
-            'supported for common inference criteria. ')
-        parser.add_argument(
-            '--quantization-param-path',
-            type=str,
-            default=None,
-            help='Path to the JSON file containing the KV cache '
-            'scaling factors. This should generally be supplied, when '
-            'KV cache dtype is FP8. Otherwise, KV cache scaling factors '
-            'default to 1.0, which may cause accuracy issues. '
-            'FP8_E5M2 (without scaling) is only supported on cuda version'
-            'greater than 11.8. On ROCm (AMD GPU), FP8_E4M3 is instead '
-            'supported for common inference criteria. ')
+            'data type. Note FP8 is not supported when cuda version is '
+            'lower than 11.8.')
         parser.add_argument('--max-model-len',
                             type=int,
                             default=EngineArgs.max_model_len,
                             help='model context length. If unspecified, '
                             'will be automatically derived from the model.')
-        parser.add_argument(
-            '--guided-decoding-backend',
-            type=str,
-            default='outlines',
-            choices=['outlines', 'lm-format-enforcer'],
-            help='Which engine will be used for guided decoding'
-            ' (JSON schema / regex etc)')
         # Parallel arguments
         parser.add_argument('--worker-use-ray',
                             action='store_true',
@@ -260,7 +227,7 @@ class EngineArgs:
             'the model executor, which can range from 0 to 1.'
             'If unspecified, will use the default value of 0.9.')
         parser.add_argument(
-            '--num-gpu-blocks-override',
+            '--forced-num-gpu-blocks',
             type=int,
             default=None,
             help='If specified, ignore GPU profiling result and use this number'
@@ -287,7 +254,7 @@ class EngineArgs:
         parser.add_argument('--quantization',
                             '-q',
                             type=str,
-                            choices=[*QUANTIZATION_METHODS, None],
+                            choices=['awq', 'gptq', 'squeezellm', None],
                             default=EngineArgs.quantization,
                             help='Method used to quantize the weights. If '
                             'None, we first check the `quantization_config` '
@@ -400,33 +367,10 @@ class EngineArgs:
             'prompt latency) before scheduling next prompt.')
         parser.add_argument(
             '--enable-chunked-prefill',
-            action='store_true',
-            help='If set, the prefill requests can be chunked based on the '
+            type=bool,
+            default=False,
+            help='If True, the prefill requests can be chunked based on the '
             'max_num_batched_tokens')
-
-        parser.add_argument(
-            '--speculative-model',
-            type=str,
-            default=None,
-            help=
-            'The name of the draft model to be used in speculative decoding.')
-
-        parser.add_argument(
-            '--num-speculative-tokens',
-            type=int,
-            default=None,
-            help='The number of speculative tokens to sample from '
-            'the draft model in speculative decoding')
-
-        parser.add_argument('--model-loader-extra-config',
-                            type=str,
-                            default=EngineArgs.model_loader_extra_config,
-                            help='Extra config for model loader. '
-                            'This will be passed to the model loader '
-                            'corresponding to the chosen load_format. '
-                            'This should be a JSON string that will be '
-                            'parsed into a dictionary.')
-
         return parser
 
     @classmethod
@@ -437,19 +381,23 @@ class EngineArgs:
         engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
         return engine_args
 
-    def create_engine_config(self, ) -> EngineConfig:
+    def create_engine_configs(
+        self,
+    ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig,
+               DeviceConfig, Optional[LoRAConfig],
+               Optional[VisionLanguageConfig]]:
         device_config = DeviceConfig(self.device)
         model_config = ModelConfig(
             self.model, self.tokenizer, self.tokenizer_mode,
-            self.trust_remote_code, self.dtype, self.seed, self.revision,
-            self.code_revision, self.tokenizer_revision, self.max_model_len,
-            self.quantization, self.quantization_param_path,
+            self.trust_remote_code, self.download_dir, self.load_format,
+            self.dtype, self.seed, self.revision, self.code_revision,
+            self.tokenizer_revision, self.max_model_len, self.quantization,
             self.enforce_eager, self.max_context_len_to_capture,
             self.max_logprobs)
         cache_config = CacheConfig(self.block_size,
                                    self.gpu_memory_utilization,
                                    self.swap_space, self.kv_cache_dtype,
-                                   self.num_gpu_blocks_override,
+                                   self.forced_num_gpu_blocks,
                                    model_config.get_sliding_window(),
                                    self.enable_prefix_caching)
         parallel_config = ParallelConfig(
@@ -461,23 +409,12 @@ class EngineArgs:
                 self.tokenizer_pool_type,
                 self.tokenizer_pool_extra_config,
             ), self.ray_workers_use_nsight)
-
-        speculative_config = SpeculativeConfig.maybe_create_spec_config(
-            target_model_config=model_config,
-            target_parallel_config=parallel_config,
-            target_dtype=self.dtype,
-            speculative_model=self.speculative_model,
-            num_speculative_tokens=self.num_speculative_tokens,
-        )
-
         scheduler_config = SchedulerConfig(
             self.max_num_batched_tokens,
             self.max_num_seqs,
             model_config.max_model_len,
             self.use_v2_block_manager,
-            num_lookahead_slots=(self.num_lookahead_slots
-                                 if speculative_config is None else
-                                 speculative_config.num_lookahead_slots),
+            num_lookahead_slots=self.num_lookahead_slots,
             delay_factor=self.scheduler_delay_factor,
             enable_chunked_prefill=self.enable_chunked_prefill,
         )
@@ -488,12 +425,6 @@ class EngineArgs:
             lora_dtype=self.lora_dtype,
             max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
             and self.max_cpu_loras > 0 else None) if self.enable_lora else None
-
-        load_config = LoadConfig(
-            load_format=self.load_format,
-            download_dir=self.download_dir,
-            model_loader_extra_config=self.model_loader_extra_config,
-        )
 
         if self.image_input_type:
             if (not self.image_token_id or not self.image_input_shape
@@ -511,19 +442,8 @@ class EngineArgs:
         else:
             vision_language_config = None
 
-        decoding_config = DecodingConfig(
-            guided_decoding_backend=self.guided_decoding_backend)
-
-        return EngineConfig(model_config=model_config,
-                            cache_config=cache_config,
-                            parallel_config=parallel_config,
-                            scheduler_config=scheduler_config,
-                            device_config=device_config,
-                            lora_config=lora_config,
-                            vision_language_config=vision_language_config,
-                            speculative_config=speculative_config,
-                            load_config=load_config,
-                            decoding_config=decoding_config)
+        return (model_config, cache_config, parallel_config, scheduler_config,
+                device_config, lora_config, vision_language_config)
 
 
 @dataclass

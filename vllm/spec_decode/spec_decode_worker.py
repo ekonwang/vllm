@@ -3,9 +3,9 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from vllm.logger import init_logger
+from vllm.config import CacheConfig
 from vllm.model_executor.layers.rejection_sampler import RejectionSampler
-from vllm.sequence import (Logprob, SamplerOutput, SequenceGroupMetadata,
+from vllm.sequence import (SamplerOutput, SequenceGroupMetadata,
                            SequenceGroupOutput, SequenceOutput)
 from vllm.spec_decode.batch_expansion import BatchExpansionTop1Scorer
 from vllm.spec_decode.interfaces import (SpeculativeProposals,
@@ -14,12 +14,10 @@ from vllm.spec_decode.metrics import AsyncMetricsCollector
 from vllm.spec_decode.multi_step_worker import MultiStepWorker
 from vllm.spec_decode.util import (get_all_seq_ids, nvtx_range,
                                    split_batch_by_proposal_len)
-from vllm.worker.worker_base import LoraNotSupportedWorkerBase, WorkerBase
-
-logger = init_logger(__name__)
+from vllm.worker.worker import Worker
 
 
-class SpecDecodeWorker(LoraNotSupportedWorkerBase):
+class SpecDecodeWorker:
     """Worker which implements speculative decoding.
 
     Speculative decoding reduces decoding per-token latency by using a proposal
@@ -47,20 +45,10 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         More info here https://docs.google.com/document/d/1T-JaS2T1NRfdP51qzqpyakoCXxSXTtORppiwaj5asxA/edit.
     """
 
-    @classmethod
-    def from_workers(cls, proposer_worker: MultiStepWorker,
-                     scorer_worker: WorkerBase) -> "SpecDecodeWorker":
-        return SpecDecodeWorker(
-            proposer_worker,
-            scorer_worker,
-            # TODO(cade) disable strict mode for speedup.
-            rejection_sampler=RejectionSampler(strict_mode=True),
-        )
-
     def __init__(
         self,
         proposer_worker: MultiStepWorker,
-        scorer_worker: WorkerBase,
+        scorer_worker: Worker,
         rejection_sampler: RejectionSampler,
         metrics_collector: Optional[AsyncMetricsCollector] = None,
     ):
@@ -89,8 +77,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         self.probs_dtype = self.rejection_sampler.probs_dtype
         self.token_id_dtype = self.rejection_sampler.token_id_dtype
 
-        # Lazy initiazliation.
-        self.scorer: SpeculativeScorer
+        self.scorer: SpeculativeScorer = None
 
     def init_device(self) -> None:
         """Initialize both scorer and proposer models.
@@ -100,10 +87,6 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         self.scorer_worker.init_device()
         self.proposer_worker.init_device()
 
-        # NOTE(cade): load_model is not part of the WorkerBase interface.
-        self.scorer_worker.load_model()
-        self.proposer_worker.load_model()
-
         self._metrics.init_gpu_tensors(self.rank)
         self.rejection_sampler.init_gpu_tensors(self.rank)
         self.scorer = BatchExpansionTop1Scorer(
@@ -111,7 +94,10 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             device=self.device,
             vocab_size=self._vocab_size)
 
-    def determine_num_available_blocks(self) -> Tuple[int, int]:
+    def profile_num_available_blocks(self, block_size: int,
+                                     gpu_memory_utilization: float,
+                                     cpu_swap_space: int,
+                                     cache_dtype: str) -> Tuple[int, int]:
         """Determine the number of cache blocks to use.
 
         This is done by profiling the scorer model (which is typically the
@@ -120,26 +106,27 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         such that the number of blocks is equal in both KV caches.
         """
         num_gpu_blocks, num_cpu_blocks = (
-            self.scorer_worker.determine_num_available_blocks())
+            self.scorer_worker.profile_num_available_blocks(
+                block_size, gpu_memory_utilization, cpu_swap_space,
+                cache_dtype))
 
         scorer_cache_block_size_bytes = (
-            self.scorer_worker.get_cache_block_size_bytes())
+            self.scorer_worker.get_cache_block_size_bytes(
+                block_size, cache_dtype))
         proposer_cache_block_size_bytes = (
-            self.proposer_worker.get_cache_block_size_bytes())
+            self.proposer_worker.get_cache_block_size_bytes(
+                block_size, cache_dtype))
 
         new_num_gpu_blocks = split_num_cache_blocks_evenly(
             scorer_cache_block_size_bytes, proposer_cache_block_size_bytes,
             num_gpu_blocks)
         return new_num_gpu_blocks, num_cpu_blocks
 
-    def initialize_cache(self, num_gpu_blocks: int,
-                         num_cpu_blocks: int) -> None:
+    def init_cache_engine(self, cache_config: CacheConfig):
         """Initialize the cache engine of the scorer and proposer workers.
         """
-        self.scorer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
-                                            num_cpu_blocks=num_cpu_blocks)
-        self.proposer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
-                                              num_cpu_blocks=num_cpu_blocks)
+        self.scorer_worker.init_cache_engine(cache_config)
+        self.proposer_worker.init_cache_engine(cache_config)
 
     @torch.inference_mode()
     def execute_model(
@@ -148,7 +135,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         blocks_to_swap_in: Optional[Dict[int, int]],
         blocks_to_swap_out: Optional[Dict[int, int]],
         blocks_to_copy: Optional[Dict[int, List[int]]],
-        num_lookahead_slots: int,
+        num_spec_tokens: int,
     ) -> List[SamplerOutput]:
         """Perform speculative decoding on the input batch.
         """
@@ -157,11 +144,9 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             "speculative decoding "
             "requires non-None seq_group_metadata_list")
 
-        logger.info(f"spec_decode_worker.execute_model {num_lookahead_slots=}")
-
         # If no spec tokens, call the proposer and scorer workers normally.
         # Used for prefill.
-        if num_lookahead_slots == 0 or len(seq_group_metadata_list) == 0:
+        if num_spec_tokens == 0 or len(seq_group_metadata_list) == 0:
             return self._run_no_spec(
                 seq_group_metadata_list=seq_group_metadata_list,
                 blocks_to_swap_in=blocks_to_swap_in,
@@ -174,7 +159,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
-            k=num_lookahead_slots,
+            k=num_spec_tokens,
         )
 
     @nvtx_range("spec_decode_worker._run_no_spec")
@@ -189,24 +174,20 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         proposer and scorer model so that the KV cache is consistent between the
         two.
         """
-        logger.info("run proposer worker no spec")
 
         self.proposer_worker.execute_model(
             seq_group_metadata_list=seq_group_metadata_list,
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
-        )
+            return_python_output=False)
 
-        logger.info("run target worker no spec")
         sampler_output = self.scorer_worker.execute_model(
             seq_group_metadata_list=seq_group_metadata_list,
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
         )
-        assert len(sampler_output) == 1
-        sampler_output = sampler_output[0]
 
         # Clear device tensors from sampler output. This reduces communication
         # overhead when the engine runs in a different process than the workers.
@@ -232,16 +213,11 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         sequence.
         """
 
-        logger.info("get spec proposals")
         # Generate proposals using draft worker.
-        assert blocks_to_swap_in is not None
-        assert blocks_to_swap_out is not None
-        assert blocks_to_copy is not None
         proposals = self.proposer_worker.get_spec_proposals(
             seq_group_metadata_list, blocks_to_swap_in, blocks_to_swap_out,
             blocks_to_copy, k)
 
-        logger.info("score proposals")
         proposal_scores = self.scorer.score_proposals(
             seq_group_metadata_list,
             blocks_to_swap_in,
@@ -251,11 +227,9 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             proposals,
         )
 
-        logger.info("verify proposals")
         accepted_token_ids = self._verify_tokens(seq_group_metadata_list,
                                                  proposal_scores, proposals, k)
 
-        logger.info("create output list")
         return self._create_output_sampler_list(seq_group_metadata_list,
                                                 accepted_token_ids, k)
 
@@ -341,7 +315,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
                                 parent_seq_id=seq_id,
                                 output_token=token_id,
                                 # TODO Add verifier logprobs.
-                                logprobs={token_id: Logprob(0.0)},
+                                logprobs={token_id: 0.0},
                             )
                         ],
                         prompt_logprobs=None,
@@ -376,16 +350,6 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
     @property
     def device(self):
         return self.scorer_worker.device
-
-    def get_cache_block_size_bytes(self):
-        """Return the size of a cache block in bytes.
-        
-        This function is only used to compose workers within a SpecDecodeWorker.
-        We leave composing a SpecDecodeWorker within a SpecDecodeWorker
-        undefined for now, although it could be implemented in the future.
-        See https://arxiv.org/abs/2308.04623.
-        """
-        raise NotImplementedError
 
 
 def split_num_cache_blocks_evenly(scorer_cache_block_size_bytes: int,

@@ -6,10 +6,10 @@ import torch
 from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
 from vllm.spec_decode.interfaces import (SpeculativeProposals,
                                          SpeculativeScorer, SpeculativeScores)
-from vllm.spec_decode.util import (get_all_seq_ids, maybe_mock_device_tensors,
-                                   nvtx_range, sampler_output_to_torch,
+from vllm.spec_decode.util import (get_all_seq_ids, nvtx_range,
+                                   sampler_output_to_torch,
                                    split_batch_by_proposal_len)
-from vllm.worker.worker_base import WorkerBase
+from vllm.worker.worker import Worker
 
 SeqId = int
 TargetSeqId = int
@@ -31,8 +31,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
     of topk/tree.
     """
 
-    def __init__(self, scorer_worker: WorkerBase, device: str,
-                 vocab_size: int):
+    def __init__(self, scorer_worker: Worker, device: str, vocab_size: int):
         self._scorer_worker = scorer_worker
         self._device = device
         self._vocab_size = vocab_size
@@ -84,9 +83,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
-        )
-        assert len(target_sampler_output) == 1, "expected single-step output"
-        target_sampler_output = target_sampler_output[0]
+            return_python_output=False)
 
         all_tokens, all_probs = self._contract_batch(
             original_bs=len(seq_group_metadata_list),
@@ -106,7 +103,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
     def _expand_batch(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
-        proposal_token_ids_list: List[List[TokenId]],
+        proposal_token_ids_list: List[TokenId],
         proposal_lens_list: List[int],
     ) -> Tuple[List[int], List[int], List[SequenceGroupMetadata], int]:
         """Given the input sequences and potentially multiple corresponding
@@ -145,16 +142,6 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
         This maps the scores of speculative tokens back to their original
         sequences.
         """
-
-        # We mock the device tensors until PR 7/9 is merged (e2e correctness).
-        # https://docs.google.com/document/d/1rE4pr3IdspRw97XbImY4fS9IWYuJJ3HGtL7AdIKGrw8/edit#heading=h.qijw1sdidrer
-        maybe_mock_device_tensors(
-            sampler_output=target_sampler_output,
-            batch_size=len(non_spec_indices) + num_scoring_tokens,
-            vocab_size=self._vocab_size,
-            device=self._device,
-        )
-
         (target_token_ids, target_probs, non_spec_target_token_ids,
          non_spec_target_probs) = self._split_scoring_output(
              target_sampler_output, num_scoring_tokens)
@@ -218,7 +205,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
     def _create_target_seq_group_metadata(
         self,
         input_seq_group_metadata: SequenceGroupMetadata,
-        proposal_token_ids: List[List[TokenId]],  # shape: [batch_size, k]
+        proposal_token_ids: List[TokenId],  # shape: [batch_size, k]
         batch_index: int,
         target_seq_ids_iter: Iterator[TargetSeqId],
     ) -> List[SequenceGroupMetadata]:
@@ -360,7 +347,7 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
                 [0, 1, 2]
                 [0, 1, 2, 3]
         """
-        empty_token_ids: List[TokenId] = []
+        empty_token_ids = []
 
         token_ids_to_score = [empty_token_ids]
         token_ids_to_score.extend([

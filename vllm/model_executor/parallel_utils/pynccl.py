@@ -21,7 +21,7 @@
 
 import ctypes
 import datetime
-import platform
+import os
 
 # ===================== import region =====================
 import torch
@@ -29,27 +29,31 @@ import torch.distributed as dist
 from torch.distributed import ReduceOp
 
 from vllm.logger import init_logger
-from vllm.utils import find_nccl_library, nccl_integrity_check
 
 logger = init_logger(__name__)
 
-so_file = find_nccl_library()
+so_file = os.environ.get("VLLM_NCCL_SO_PATH", "")
+
+# manually load the nccl library
+if so_file:
+    logger.info(
+        f"Loading nccl from environment variable VLLM_NCCL_SO_PATH={so_file}")
+else:
+    if torch.version.cuda is not None:
+        so_file = "libnccl.so.2"
+    elif torch.version.hip is not None:
+        so_file = "librccl.so.1"
+    else:
+        raise ValueError("NCCL only supports CUDA and ROCm backends.")
+    logger.debug(f"Loading nccl from library {so_file}")
 
 try:
-    # load the library in another process.
-    # if it core dumps, it will not crash the current process
-    nccl_integrity_check(so_file)
     nccl = ctypes.CDLL(so_file)
 except Exception as e:
     logger.error(
         f"Failed to load NCCL library from {so_file} ."
         "It is expected if you are not running on NVIDIA/AMD GPUs."
-        "Otherwise, the nccl library might not exist, be corrupted "
-        f"or it does not support the current platform {platform.platform()}."
-        f"One solution is to download libnccl2 version 2.18 from "
-        f"https://developer.download.nvidia.com/compute/cuda/repos/ "
-        f"and extract the libnccl.so.2 file. If you already have the "
-        f"library, please set the environment variable VLLM_NCCL_SO_PATH"
+        "Otherwise please set the environment variable VLLM_NCCL_SO_PATH"
         " to point to the correct nccl library path.")
     raise e
 
@@ -222,25 +226,22 @@ class NCCLCommunicator:
         if local_rank == -1:
             local_rank = self.rank
         self.local_rank = local_rank
-        # don't use these args, as they can be -1
-        # use `self.rank`, `self.local_rank` and `self.world_size` instead
-        del world_size, rank, local_rank
-        torch.cuda.set_device(self.local_rank)
-        if self.rank == 0:
+        torch.cuda.set_device(local_rank)
+        if rank == 0:
             self.unique_id = ncclGetUniqueId()
         else:
             self.unique_id = NcclUniqueId()
-        tensor = torch.ByteTensor(list(self.unique_id.internal)).cuda(
-            self.local_rank)
+        tensor = torch.ByteTensor(list(
+            self.unique_id.internal)).cuda(local_rank)
         dist.broadcast(tensor, src=0)
         byte_list = tensor.cpu().tolist()
         for i, byte in enumerate(byte_list):
             self.unique_id.internal[i] = byte
         self.comm = ctypes.c_void_p()
-        result = _c_ncclCommInitRank(ctypes.byref(self.comm), self.world_size,
-                                     self.unique_id, self.rank)
+        result = _c_ncclCommInitRank(ctypes.byref(self.comm), world_size,
+                                     self.unique_id, rank)
         assert result == 0
-        self.stream = torch.cuda.Stream(device=f"cuda:{self.local_rank}")
+        self.stream = torch.cuda.Stream(device=f"cuda:{local_rank}")
 
     def all_reduce(self,
                    tensor: torch.Tensor,
@@ -260,6 +261,4 @@ class NCCLCommunicator:
         # `dist` module might have been already destroyed
         if hasattr(dist, 'destroy_process_group'):
             dist.destroy_process_group()
-        # function might have been already destroyed
-        if _c_ncclCommDestroy is not None:
-            _c_ncclCommDestroy(self.comm)
+        _c_ncclCommDestroy(self.comm)

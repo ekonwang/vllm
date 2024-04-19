@@ -1,18 +1,16 @@
 import asyncio
 import enum
 import gc
-import glob
 import os
 import socket
 import subprocess
 import uuid
 import warnings
-from collections import defaultdict
+from collections import OrderedDict
 from functools import lru_cache, partial
 from platform import uname
-from typing import (Any, AsyncIterator, Awaitable, Callable, Dict, Generic,
-                    Hashable, List, Optional, OrderedDict, Tuple, TypeVar,
-                    Union)
+from typing import (Any, Awaitable, Callable, Generic, Hashable, List,
+                    Optional, Tuple, TypeVar, Union)
 
 import psutil
 import torch
@@ -27,7 +25,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": torch.bfloat16,
     "float": torch.float,
-    "fp8": torch.uint8,
+    "fp8_e5m2": torch.uint8,
 }
 
 
@@ -53,7 +51,7 @@ class Counter:
 class LRUCache(Generic[T]):
 
     def __init__(self, capacity: int):
-        self.cache: OrderedDict[Hashable, T] = OrderedDict()
+        self.cache = OrderedDict[Hashable, T]()
         self.capacity = capacity
 
     def __contains__(self, key: Hashable) -> bool:
@@ -62,7 +60,7 @@ class LRUCache(Generic[T]):
     def __len__(self) -> int:
         return len(self.cache)
 
-    def __getitem__(self, key: Hashable) -> Optional[T]:
+    def __getitem__(self, key: Hashable) -> T:
         return self.get(key)
 
     def __setitem__(self, key: Hashable, value: T) -> None:
@@ -78,7 +76,7 @@ class LRUCache(Generic[T]):
             key: Hashable,
             default_value: Optional[T] = None) -> Optional[T]:
         if key in self.cache:
-            value: Optional[T] = self.cache[key]
+            value = self.cache[key]
             self.cache.move_to_end(key)
         else:
             value = default_value
@@ -89,7 +87,7 @@ class LRUCache(Generic[T]):
         self.cache.move_to_end(key)
         self._remove_old_if_needed()
 
-    def _on_remove(self, key: Hashable, value: Optional[T]):
+    def _on_remove(self, key: Hashable, value: T):
         pass
 
     def remove_oldest(self):
@@ -102,11 +100,9 @@ class LRUCache(Generic[T]):
         while len(self.cache) > self.capacity:
             self.remove_oldest()
 
-    def pop(self,
-            key: Hashable,
-            default_value: Optional[T] = None) -> Optional[T]:
+    def pop(self, key: Hashable, default_value: Optional[Any] = None) -> T:
         run_on_remove = key in self.cache
-        value: Optional[T] = self.cache.pop(key, default_value)
+        value = self.cache.pop(key, default_value)
         if run_on_remove:
             self._on_remove(key, value)
         return value
@@ -123,11 +119,9 @@ def is_hip() -> bool:
 
 @lru_cache(maxsize=None)
 def is_cpu() -> bool:
-    from importlib.metadata import PackageNotFoundError, version
-    try:
-        return "cpu" in version("vllm")
-    except PackageNotFoundError:
-        return False
+    from importlib.metadata import version
+    is_cpu_flag = "cpu" in version("vllm")
+    return is_cpu_flag
 
 
 @lru_cache(maxsize=None)
@@ -164,17 +158,6 @@ def random_uuid() -> str:
 
 
 @lru_cache(maxsize=None)
-def get_vllm_instance_id():
-    """
-    If the environment variable VLLM_INSTANCE_ID is set, return it.
-    Otherwise, return a random UUID.
-    Instance id represents an instance of the VLLM. All processes in the same
-    instance should have the same instance id.
-    """
-    return os.environ.get("VLLM_INSTANCE_ID", f"vllm-instance-{random_uuid()}")
-
-
-@lru_cache(maxsize=None)
 def in_wsl() -> bool:
     # Reference: https://github.com/microsoft/WSL/issues/4071
     return "microsoft" in " ".join(uname()).lower()
@@ -194,42 +177,6 @@ def make_async(func: Callable[..., T]) -> Callable[..., Awaitable[T]]:
         return loop.run_in_executor(executor=None, func=p_func)
 
     return _async_wrapper
-
-
-def merge_async_iterators(
-        *iterators: AsyncIterator[T]) -> AsyncIterator[Tuple[int, T]]:
-    """Merge multiple asynchronous iterators into a single iterator.
-
-    This method handle the case where some iterators finish before others.
-    When it yields, it yields a tuple (i, item) where i is the index of the
-    iterator that yields the item.
-    """
-    queue: asyncio.Queue[Union[Tuple[int, T], Exception]] = asyncio.Queue()
-
-    finished = [False] * len(iterators)
-
-    async def producer(i: int, iterator: AsyncIterator[T]):
-        try:
-            async for item in iterator:
-                await queue.put((i, item))
-        except Exception as e:
-            await queue.put(e)
-        finished[i] = True
-
-    _tasks = [
-        asyncio.create_task(producer(i, iterator))
-        for i, iterator in enumerate(iterators)
-    ]
-
-    async def consumer():
-        while not all(finished) or not queue.empty():
-            item = await queue.get()
-            if isinstance(item, Exception):
-                raise item
-            yield item
-        await asyncio.gather(*_tasks)
-
-    return consumer()
 
 
 def get_ip() -> str:
@@ -283,12 +230,8 @@ def get_open_port() -> int:
             return s.getsockname()[1]
 
 
-def update_environment_variables(envs: Dict[str, str]):
-    for k, v in envs.items():
-        if k in os.environ and os.environ[k] != v:
-            logger.warning(f"Overwriting environment variable {k} "
-                           f"from '{os.environ[k]}' to '{v}'")
-        os.environ[k] = v
+def set_cuda_visible_devices(device_ids: List[int]) -> None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, device_ids))
 
 
 def chunk_list(lst, chunk_size):
@@ -321,7 +264,7 @@ def get_nvcc_cuda_version() -> Optional[Version]:
     return nvcc_cuda_version
 
 
-def _generate_random_fp8(
+def _generate_random_fp8_e5m2(
     tensor: torch.tensor,
     low: float,
     high: float,
@@ -334,10 +277,10 @@ def _generate_random_fp8(
     #-----|-------------|-------------------
     # Inf | N/A         | s.11111.00
     # NaN | s.1111.111  | s.11111.{01,10,11}
-    from vllm import _custom_ops as ops
+    from vllm._C import cache_ops
     tensor_tmp = torch.empty_like(tensor, dtype=torch.float16)
     tensor_tmp.uniform_(low, high)
-    ops.convert_fp8(tensor_tmp, tensor)
+    cache_ops.convert_fp8_e5m2(tensor_tmp, tensor)
     del tensor_tmp
 
 
@@ -349,7 +292,7 @@ def create_kv_caches_with_random(
     head_size: int,
     cache_dtype: Optional[Union[str, torch.dtype]],
     model_dtype: Optional[Union[str, torch.dtype]] = None,
-    seed: int = 0,
+    seed: Optional[int] = 0,
     device: Optional[str] = "cuda",
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     torch.random.manual_seed(seed)
@@ -366,7 +309,7 @@ def create_kv_caches_with_random(
                 raise ValueError(f"Invalid model dtype: {model_dtype}")
         elif cache_dtype in ["half", "bfloat16", "float"]:
             torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
-        elif cache_dtype == "fp8":
+        elif cache_dtype == "fp8_e5m2":
             torch_dtype = torch.uint8
         else:
             raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
@@ -383,10 +326,10 @@ def create_kv_caches_with_random(
         key_cache = torch.empty(size=key_cache_shape,
                                 dtype=torch_dtype,
                                 device=device)
-        if cache_dtype in ["auto", "half", "bfloat16", "float"]:
+        if cache_dtype == 'fp8_e5m2':
+            _generate_random_fp8_e5m2(key_cache, -scale, scale)
+        elif torch_dtype in [torch.half, torch.bfloat16, torch.float]:
             key_cache.uniform_(-scale, scale)
-        elif cache_dtype == 'fp8':
-            _generate_random_fp8(key_cache, -scale, scale)
         else:
             raise ValueError(
                 f"Does not support key cache of type {cache_dtype}")
@@ -398,10 +341,10 @@ def create_kv_caches_with_random(
         value_cache = torch.empty(size=value_cache_shape,
                                   dtype=torch_dtype,
                                   device=device)
-        if cache_dtype in ["auto", "half", "bfloat16", "float"]:
+        if cache_dtype == 'fp8_e5m2':
+            _generate_random_fp8_e5m2(value_cache, -scale, scale)
+        elif torch_dtype in [torch.half, torch.bfloat16, torch.float]:
             value_cache.uniform_(-scale, scale)
-        elif cache_dtype == 'fp8':
-            _generate_random_fp8(value_cache, -scale, scale)
         else:
             raise ValueError(
                 f"Does not support value cache of type {cache_dtype}")
@@ -427,6 +370,7 @@ def is_pin_memory_available() -> bool:
         print_warning_once("Pin memory is not supported on Neuron.")
         return False
     elif is_cpu():
+        print_warning_once("Pin memory is not supported on CPU.")
         return False
     return True
 
@@ -455,7 +399,7 @@ class CudaMemoryProfiler:
         gc.collect()
 
 
-def str_to_int_tuple(s: str) -> Tuple[int, ...]:
+def str_to_int_tuple(s: str) -> Tuple[int]:
     """Convert a string to a tuple of integers."""
     try:
         return tuple(map(int, s.split(",")))
@@ -504,78 +448,3 @@ def maybe_expand_dim(tensor: torch.Tensor,
     if tensor.ndim < target_dims:
         tensor = tensor.view(-1, *([size] * (target_dims - tensor.ndim)))
     return tensor
-
-
-def merge_dicts(dict1: Dict[Any, List[Any]],
-                dict2: Dict[Any, List[Any]]) -> Dict[Any, List[Any]]:
-    """Merge 2 dicts that have key -> List of items.
-    
-    When a key conflicts, the values in dict1 is prioritized.
-    """
-    merged_dict = defaultdict(list)
-
-    for key, value in dict1.items():
-        merged_dict[key].extend(value)
-
-    for key, value in dict2.items():
-        merged_dict[key].extend(value)
-
-    return dict(merged_dict)
-
-
-def init_cached_hf_modules():
-    """
-    Lazy initialization of the Hugging Face modules.
-    """
-    from transformers.dynamic_module_utils import init_hf_modules
-    init_hf_modules()
-
-
-def nccl_integrity_check(filepath):
-    """
-    when the library is corrupted, we cannot catch
-    the exception in python. it will crash the process.
-    instead, we use the exit code of `ldd` to check
-    if the library is corrupted. if not, we will return
-    the version of the library.
-    """
-    exit_code = os.system(f"ldd {filepath} 2>&1 > /dev/null")
-    if exit_code != 0:
-        raise RuntimeError(f"Failed to load NCCL library from {filepath} .")
-    import ctypes
-
-    nccl = ctypes.CDLL(filepath)
-    version = ctypes.c_int()
-    nccl.ncclGetVersion.restype = ctypes.c_int
-    nccl.ncclGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
-    result = nccl.ncclGetVersion(ctypes.byref(version))
-    assert result == 0
-    return version.value
-
-
-def find_nccl_library():
-    so_file = os.environ.get("VLLM_NCCL_SO_PATH", "")
-
-    # check if we have vllm-managed nccl
-    vllm_nccl_path = None
-    if torch.version.cuda is not None:
-        cuda_major = torch.version.cuda.split(".")[0]
-        path = os.path.expanduser(
-            f"~/.config/vllm/nccl/cu{cuda_major}/libnccl.so.*")
-        files = glob.glob(path)
-        vllm_nccl_path = files[0] if files else None
-
-    # manually load the nccl library
-    if so_file:
-        logger.info(
-            f"Found nccl from environment variable VLLM_NCCL_SO_PATH={so_file}"
-        )
-    else:
-        if torch.version.cuda is not None:
-            so_file = vllm_nccl_path or "libnccl.so.2"
-        elif torch.version.hip is not None:
-            so_file = "librccl.so.1"
-        else:
-            raise ValueError("NCCL only supports CUDA and ROCm backends.")
-        logger.info(f"Found nccl from library {so_file}")
-    return so_file

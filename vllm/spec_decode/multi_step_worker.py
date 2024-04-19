@@ -6,8 +6,7 @@ import torch
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.spec_decode.interfaces import (SpeculativeProposals,
                                          SpeculativeProposer)
-from vllm.spec_decode.util import (maybe_mock_device_tensors,
-                                   sampler_output_to_torch)
+from vllm.spec_decode.util import sampler_output_to_torch
 from vllm.worker.worker import Worker
 
 
@@ -26,8 +25,7 @@ class MultiStepWorker(Worker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Lazy initialization list.
-        self._proposer: DraftModelTop1Proposer
+        self._proposer: Optional[DraftModelTop1Proposer] = None
 
     def init_device(self):
         super().init_device()
@@ -71,9 +69,6 @@ class MultiStepWorker(Worker):
                 blocks_to_swap_out=blocks_to_swap_out,
                 blocks_to_copy=blocks_to_copy,
             )
-            assert (len(model_output) == 1
-                    ), "composing multistep workers not supported"
-            model_output = model_output[0]
 
             self._append_new_tokens(model_output,
                                     copied_seq_group_metadata_list)
@@ -339,22 +334,12 @@ class DraftModelTop1Proposer(SpeculativeProposer):
                                          self._vocab_size,
                                          dtype=torch.float32,
                                          device=self._device)
-            proposal_lens_tensor = torch.zeros(len(proposal_lens),
-                                               dtype=torch.long,
-                                               device=self._device)
-            return proposal_tokens, proposal_probs, proposal_lens_tensor
+            proposal_lens = torch.zeros(len(proposal_lens),
+                                        dtype=torch.long,
+                                        device=self._device)
+            return proposal_tokens, proposal_probs, proposal_lens
 
         sampler_output = maybe_sampler_output
-
-        # We mock the device tensors until PR 7/9 is merged (e2e correctness).
-        # https://docs.google.com/document/d/1rE4pr3IdspRw97XbImY4fS9IWYuJJ3HGtL7AdIKGrw8/edit#heading=h.qijw1sdidrer
-        for step_output in sampler_output:
-            maybe_mock_device_tensors(
-                sampler_output=step_output,
-                batch_size=len(proposal_lens),
-                vocab_size=self._vocab_size,
-                device=self._device,
-            )
 
         proposal_tokens, proposal_probs = sampler_output_to_torch(
             sampler_output)
@@ -377,9 +362,9 @@ class DraftModelTop1Proposer(SpeculativeProposer):
         proposal_tokens, proposal_probs = (entire_proposal_tokens,
                                            entire_proposal_probs)
 
-        proposal_lens_tensor = torch.zeros(batch_size,
-                                           dtype=torch.long,
-                                           device=self._device)
-        proposal_lens_tensor[nonzero_proposal_len_indices] = max_proposal_len
+        proposal_lens = torch.zeros(batch_size,
+                                    dtype=torch.long,
+                                    device=self._device)
+        proposal_lens[nonzero_proposal_len_indices] = max_proposal_len
 
-        return proposal_tokens, proposal_probs, proposal_lens_tensor
+        return proposal_tokens, proposal_probs, proposal_lens
